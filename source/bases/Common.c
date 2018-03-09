@@ -7,6 +7,15 @@
 #include <eval.h>
 #include <osdefs.h>
 
+// Asks the Nvidia Optimus / AMD driver to use the high performance GPU if available
+#if defined(MS_WINDOWS)
+    _declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+    _declspec(dllexport) DWORD AmdPowerXpressRequestHighPerformance = 0x00000001;
+#else
+    __attribute__((dllexport)) int NvOptimusEnablement = 0x00000001;
+    __attribute__((dllexport)) int AmdPowerXpressRequestHighPerformance = 0x00000001;
+#endif
+
 // define format for sys.path
 // this consists of <dir>/lib/library.zip and <dir>/lib
 // where <dir> refers to the directory in which the executable is found
