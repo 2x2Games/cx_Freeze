@@ -1,3 +1,4 @@
+import glob
 import os
 import sys
 
@@ -72,6 +73,11 @@ def initialize(finder):
     finder.ExcludeModule("Tkinter")
 
 
+def load_asyncio(finder, module):
+    """the asyncio must be loaded as a package."""
+    finder.IncludePackage('asyncio')
+
+
 def load_cElementTree(finder, module):
     """the cElementTree module implicitly loads the elementtree.ElementTree
        module; make sure this happens."""
@@ -125,6 +131,11 @@ def load_ftplib(finder, module):
     """the ftplib module attempts to import the SOCKS module; ignore this
        module if it cannot be found"""
     module.IgnoreName("SOCKS")
+
+
+def load_gevent(finder, module):
+    """gevent must be loaded as a package."""
+    finder.IncludePackage("gevent")
 
 
 def load_GifImagePlugin(finder, module):
@@ -239,6 +250,10 @@ def load_h5py(finder, module):
     finder.IncludeModule('h5py._errors')
     finder.IncludeModule('h5py.h5ac')
 
+
+def load_idna(finder, module):
+    """the idna module implicitly loads data; make sure this happens."""
+    finder.IncludeModule("idna.idnadata")
 
 def load_matplotlib(finder, module):
     """the matplotlib module requires data to be found in mpl-data in the
@@ -378,6 +393,16 @@ def load_numpy_random_mtrand(finder, module):
     module.AddGlobalName("randn")
 
 
+def load_PIL(finder, module):
+    """Pillow must be loaded as a package."""
+    finder.IncludePackage("PIL")
+
+
+def load_pkg_resources(finder, module):
+    """pkg_resources dynamic load modules in a subpackage."""
+    finder.IncludePackage("pkg_resources._vendor")
+
+
 def load_postgresql_lib(finder, module):
     """the postgresql.lib module requires the libsys.sql file to be included
        so make sure that file is included"""
@@ -389,6 +414,12 @@ def load_pty(finder, module):
     """The sgi module is not needed for this module to function."""
     module.IgnoreName("sgi")
 
+def load_pycparser(finder, module):
+    """ These files are missing which causes
+        permission denied issues on windows when they are regenerated.
+    """
+    finder.IncludeModule("pycparser.lextab")
+    finder.IncludeModule("pycparser.yacctab")
 
 def load_pydoc(finder, module):
     """The pydoc module will work without the Tkinter module so ignore the
@@ -438,7 +469,7 @@ def _qt_implementation(module):
 
 def copy_qt_plugins(plugins, finder, QtCore):
     """Helper function to find and copy Qt plugins."""
-    
+
     # Qt Plugins can either be in a plugins directory next to the Qt libraries,
     # or in other locations listed by QCoreApplication.libraryPaths()
     dir0 = os.path.join(os.path.dirname(QtCore.__file__), "plugins")
@@ -548,6 +579,9 @@ def load_PyQt5_QtMultimedia(finder, module):
     finder.IncludeModule("%s.QtMultimediaWidgets" % name)
     copy_qt_plugins("mediaservice", finder, QtCore)
 
+def load_PyQt5_QtPrintSupport(finder, module):
+    name, QtCore = _qt_implementation(module)
+    copy_qt_plugins("printsupport", finder, QtCore)
 
 def load_reportlab(finder, module):
     """the reportlab module loads a submodule rl_settings via exec so force
@@ -601,6 +635,16 @@ def load_site(finder, module):
     module.IgnoreName("usercustomize")
 
 
+def load_ssl(finder, module):
+    """In Windows, the SSL module in Python >= 3.7 requires additional dlls to
+       be present in the build directory."""
+    if sys.platform == "win32" and sys.version_info >= (3, 7):
+        for dll_search in ["libcrypto-*.dll", "libssl-*.dll"]:
+            for dll_path in glob.glob(os.path.join(sys.base_prefix, "DLLs", dll_search)):
+                dll_name = os.path.basename(dll_path)
+                finder.IncludeFiles(dll_path, os.path.join("lib", dll_name))
+
+
 def load_tkinter(finder, module):
     """the tkinter module has data files that are required to be loaded so
        ensure that they are copied into the directory that is expected at
@@ -608,10 +652,21 @@ def load_tkinter(finder, module):
     if sys.platform == "win32":
         import tkinter
         import _tkinter
-        tclSourceDir = os.environ["TCL_LIBRARY"]
-        tkSourceDir = os.environ["TK_LIBRARY"]
-        finder.IncludeFiles(tclSourceDir, "tcl")
-        finder.IncludeFiles(tkSourceDir, "tk")
+        root_names = "tcl", "tk"
+        environ_names = "TCL_LIBRARY", "TK_LIBRARY"
+        version_vars = tkinter.TclVersion, tkinter.TkVersion
+        zipped = zip(environ_names, version_vars, root_names)
+        for env_name, ver_var, mod_name in zipped:
+            try:
+                lib_texts = os.environ[env_name]
+            except KeyError:
+                lib_texts = os.path.join(sys.base_prefix, "tcl",
+                        mod_name + str(ver_var))
+            finder.IncludeFiles(lib_texts, mod_name)
+        for ver_var, mod_name in zip(version_vars, root_names):
+            dll_name = mod_name + str(ver_var).replace(".", "") + "t.dll"
+            dll_path = os.path.join(sys.base_prefix, "Dlls", dll_name)
+            finder.IncludeFiles(dll_path, os.path.join("lib", dll_name))
 
 
 def load_Tkinter(finder, module):
@@ -782,25 +837,30 @@ def missing_readline(finder, caller):
 
 
 def load_zmq(finder, module):
-    """the zmq package loads zmq.backend.cython dynamically and links 
+    """the zmq package loads zmq.backend.cython dynamically and links
     dynamically to zmq.libzmq."""
     finder.IncludePackage("zmq.backend.cython")
     if sys.platform == "win32":
         # Not sure yet if this is cross platform
-        import zmq.libzmq
-        srcFileName = os.path.basename(zmq.libzmq.__file__)
-        finder.IncludeFiles(
-            os.path.join(module.path[0], srcFileName), srcFileName)
+        # Include the bundled libzmq library, if it exists
+        try:
+            import zmq.libzmq
+            srcFileName = os.path.basename(zmq.libzmq.__file__)
+            finder.IncludeFiles(
+                os.path.join(module.path[0], srcFileName), srcFileName)
+        except ImportError:
+            pass  # No bundled libzmq library
 
 
 def load_clr(finder, module):
     """the pythonnet package (imported as 'clr') needs Python.Runtime.dll
     in runtime"""
     module_dir = os.path.dirname(module.file)
-    dllname = 'Python.Runtime.dll'
-    finder.IncludeFiles(os.path.join(module_dir, dllname), dllname)
-    
-    
+    dll_name = 'Python.Runtime.dll'
+    finder.IncludeFiles(os.path.join(module_dir, dll_name),
+            os.path.join("lib", dll_name))
+
+
 def load_sqlite3(finder, module):
     """In Windows, the sqlite3 module requires an additional dll sqlite3.dll to
        be present in the build directory."""

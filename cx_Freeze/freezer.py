@@ -6,7 +6,7 @@ from __future__ import print_function
 
 import datetime
 import distutils.sysconfig
-import imp
+from importlib.util import MAGIC_NUMBER
 import marshal
 import os
 import shutil
@@ -20,33 +20,6 @@ import zipfile
 import cx_Freeze
 
 __all__ = [ "ConfigError", "ConstantsModule", "Executable", "Freezer" ]
-
-EXTENSION_LOADER_SOURCE = \
-"""
-def __bootstrap__():
-    import imp, sys
-    os = sys.modules['os']
-    global __bootstrap__, __loader__
-    __loader__ = None; del __bootstrap__, __loader__
-
-    found = False
-    for p in sys.path:
-        if not os.path.isdir(p):
-            continue
-        f = os.path.join(p, "%s")
-        if not os.path.exists(f):
-            continue
-        m = imp.load_dynamic(__name__, f)
-        import sys
-        sys.modules[__name__] = m
-        found = True
-        break
-    if not found:
-        del sys.modules[__name__]
-        raise ImportError("No module named %%s" %% __name__)
-__bootstrap__()
-"""
-
 
 MSVCR_MANIFEST_TEMPLATE = """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -115,13 +88,11 @@ class Freezer(object):
 
     def __init__(self, executables, constantsModules = [], includes = [],
             excludes = [], packages = [], replacePaths = [], compress = True,
-            optimizeFlag = 0, path = None,
-            targetDir = None, binIncludes = [], binExcludes = [],
-            binPathIncludes = [], binPathExcludes = [],
+            optimizeFlag = 0, path = None, targetDir = None, binIncludes = [],
+            binExcludes = [], binPathIncludes = [], binPathExcludes = [],
             includeFiles = [], zipIncludes = [], silent = False,
-            namespacePackages = [], metadata = None,
-            includeMSVCR = False, zipIncludePackages = [],
-            zipExcludePackages = ["*"]):
+            namespacePackages = [], metadata = None, includeMSVCR = False,
+            zipIncludePackages = [], zipExcludePackages = ["*"]):
         self.executables = list(executables)
         self.constantsModules = list(constantsModules)
         self.includes = list(includes)
@@ -191,6 +162,10 @@ class Freezer(object):
         self.filesCopied[normalizedTarget] = None
         if copyDependentFiles \
                 and source not in self.finder.excludeDependentFiles:
+            # Always copy dependent files on root directory
+            # to allow to set relative reference
+            if sys.platform == 'darwin':
+                targetDir = self.targetDir
             for source in self._GetDependentFiles(source):
                 target = os.path.join(targetDir, os.path.basename(source))
                 self._CopyFile(source, target, copyDependentFiles)
@@ -211,6 +186,10 @@ class Freezer(object):
 
         self._CopyFile(exe.base, exe.targetName, copyDependentFiles = True,
                 includeMode = True)
+        if not os.access(exe.targetName, os.W_OK):
+            mode = os.stat(exe.targetName).st_mode
+            os.chmod(exe.targetName, mode | stat.S_IWUSR)
+
         if self.includeMSVCR:
             self._IncludeMSVCR(exe)
 
@@ -225,9 +204,6 @@ class Freezer(object):
                 self._CopyFile(exe.icon, targetName,
                         copyDependentFiles = False)
 
-        if not os.access(exe.targetName, os.W_OK):
-            mode = os.stat(exe.targetName).st_mode
-            os.chmod(exe.targetName, mode | stat.S_IWUSR)
         if self.metadata is not None and sys.platform == "win32":
             self._AddVersionResource(exe)
 
@@ -274,21 +250,29 @@ class Freezer(object):
         """Return the file's dependencies using platform-specific tools (the
            imagehlp library on Windows, otool on Mac OS X and ldd on Linux);
            limit this list by the exclusion lists as needed"""
+        dirname = os.path.dirname(path)
         dependentFiles = self.dependentFiles.get(path)
         if dependentFiles is None:
             if sys.platform == "win32":
-                origPath = os.environ["PATH"]
-                os.environ["PATH"] = origPath + os.pathsep + \
-                        os.pathsep.join(sys.path)
-                import cx_Freeze.util
-                try:
-                    dependentFiles = cx_Freeze.util.GetDependentFiles(path)
-                except cx_Freeze.util.BindError:
-                    # Sometimes this gets called when path is not actually a library
-                    # See issue 88
+                if path.endswith(('.exe', '.dll')):
+                    origPath = os.environ["PATH"]
+                    os.environ["PATH"] = origPath + os.pathsep + \
+                            os.pathsep.join(sys.path)
+                    try:
+                        dependentFiles = cx_Freeze.util.GetDependentFiles(path)
+                    except cx_Freeze.util.BindError as exc:
+                        # Sometimes this gets called when path is not actually a
+                        # library See issue 88
+                        dependentFiles = []
+                        fmt = "error during GetDependentFiles() of \"%s\": %s\n"
+                        sys.stderr.write(fmt % (path, str(exc)))
+                    os.environ["PATH"] = origPath
+                else:
                     dependentFiles = []
-                os.environ["PATH"] = origPath
             else:
+                if not os.access(path, os.X_OK):
+                    self.dependentFiles[path] = []
+                    return []
                 dependentFiles = []
                 if sys.platform == "darwin":
                     command = 'otool -L "%s"' % path
@@ -324,14 +308,28 @@ class Freezer(object):
                     # cx_Freeze on OSX in e.g. a conda-based distribution.
                     # Note that with @rpath we just assume Python's lib dir,
                     # which should work in most cases.
-                    dirname = os.path.dirname(path)
                     dependentFiles = [p.replace('@loader_path', dirname)
                                       for p in dependentFiles]
                     dependentFiles = [p.replace('@rpath', sys.prefix + '/lib')
                                       for p in dependentFiles]
             dependentFiles = self.dependentFiles[path] = \
-                    [f for f in dependentFiles if self._ShouldCopyFile(f)]
+                    [self._CheckDependentFile(f, dirname) \
+                            for f in dependentFiles if self._ShouldCopyFile(f)]
         return dependentFiles
+
+    def _CheckDependentFile(self, dependentFile, dirname):
+        """If the file does not exist, try to locate it in the directory of the
+           parent file (this is to workaround an issue in how otool returns
+           dependencies. See issue #292.
+           https://github.com/anthony-tuininga/cx_Freeze/issues/292"""
+        if os.path.isfile(dependentFile):
+            return dependentFile
+        basename = os.path.basename(dependentFile)
+        joined = os.path.join(dirname, basename)
+        if os.path.isfile(joined):
+            return joined
+        raise FileNotFoundError("otool returned a dependent file that "
+                "could not be found: " + dependentFile)
 
     def _GetModuleFinder(self, argsSource = None):
         if argsSource is None:
@@ -507,7 +505,6 @@ class Freezer(object):
         outFile = zipfile.PyZipFile(fileName, "w", zipfile.ZIP_DEFLATED)
 
         filesToCopy = []
-        magic = imp.get_magic()
         ignorePatterns = shutil.ignore_patterns("*.py", "*.pyc", "*.pyo",
                 "__pycache__")
         for module in modules:
@@ -539,15 +536,9 @@ class Freezer(object):
             # libraries cannot be loaded from a zip file
             if module.code is None and module.file is not None \
                     and not includeInFileSystem:
-                fileName = os.path.basename(module.file)
-                if "." in module.name:
-                    baseFileName, ext = os.path.splitext(fileName)
-                    fileName = module.name + ext
-                    generatedFileName = "ExtensionLoader_%s.py" % \
-                            module.name.replace(".", "_")
-                    module.code = compile(EXTENSION_LOADER_SOURCE % fileName,
-                            generatedFileName, "exec")
-                target = os.path.join(targetDir, fileName)
+                parts = module.name.split(".")[:-1]
+                parts.append(os.path.basename(module.file))
+                target = os.path.join(targetDir, ".".join(parts))
                 filesToCopy.append((module, target))
 
             # starting with Python 3.3 the pyc file format contains the source
@@ -555,10 +546,16 @@ class Freezer(object):
             # the file is up to date so we can safely set this value to zero
             if module.code is not None:
                 if module.file is not None and os.path.exists(module.file):
-                    mtime = os.stat(module.file).st_mtime
+                    stat = os.stat(module.file)
+                    mtime = stat.st_mtime
+                    size = stat.st_size & 0xFFFFFFFF
                 else:
                     mtime = time.time()
-                header = magic + struct.pack("<ii", int(mtime), 0)
+                    size = 0
+                if sys.version_info[:2] < (3, 7):
+                    header = MAGIC_NUMBER + struct.pack("<ii", int(mtime), size)
+                else:
+                    header = MAGIC_NUMBER + struct.pack("<iii", 0, int(mtime), size)
                 data = header + marshal.dumps(module.code)
 
             # if the module should be written to the file system, do so
@@ -680,10 +677,12 @@ class Executable(object):
         self._GetInitScriptFileName()
         self._GetBaseFileName()
         if self.targetName is None:
-            name, ext = os.path.splitext(os.path.basename(self.script))
+            name, _ = os.path.splitext(os.path.basename(self.script))
             baseName, ext = os.path.splitext(self.base)
             self.targetName = name + ext
         name, ext = os.path.splitext(self.targetName)
+        if ext == "" and sys.platform == "win32":
+            self.targetName += ".exe"
         self.moduleName = "%s__main__" % os.path.normcase(name)
         self.initModuleName = "%s__init__" % os.path.normcase(name)
         self.targetName = os.path.join(freezer.targetDir, self.targetName)
