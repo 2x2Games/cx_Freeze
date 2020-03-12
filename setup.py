@@ -2,7 +2,6 @@
 Distutils script for cx_Freeze.
 """
 
-import cx_Freeze
 import distutils.command.build_ext
 import distutils.command.install
 import distutils.command.install_data
@@ -28,14 +27,17 @@ class build_ext(distutils.command.build_ext.build_ext):
             return
         if sys.platform == "win32" and self.compiler.compiler_type == "mingw32":
             ext.sources.append("source/bases/manifest.rc")
-        os.environ["LD_RUN_PATH"] = "${ORIGIN}:${ORIGIN}/../lib"
+        os.environ["LD_RUN_PATH"] = "${ORIGIN}/../lib:${ORIGIN}/lib"
         objects = self.compiler.compile(ext.sources,
                 output_dir = self.build_temp,
                 include_dirs = ext.include_dirs,
                 debug = self.debug,
                 depends = ext.depends)
         fileName = os.path.splitext(self.get_ext_filename(ext.name))[0]
-        fullName = os.path.join(self.build_lib, fileName)
+        if self.inplace:
+            fullName = os.path.join(os.path.dirname(__file__), fileName)
+        else:
+            fullName = os.path.join(self.build_lib, fileName)
         libraryDirs = ext.library_dirs or []
         libraries = self.get_libraries(ext)
         extraArgs = ext.extra_link_args or []
@@ -92,9 +94,10 @@ def find_cx_Logging():
         return
     subDir = "implib.%s-%s" % (distutils.util.get_platform(), sys.version[:3])
     importLibraryDir = os.path.join(loggingDir, "build", subDir)
+    includeDir = os.path.join(loggingDir, "src")
     if not os.path.exists(importLibraryDir):
         return
-    return loggingDir, importLibraryDir
+    return includeDir, importLibraryDir
 
 
 commandClasses = dict(build_ext=build_ext)
@@ -109,14 +112,12 @@ utilModule = Extension("cx_Freeze.util", ["source/util.c"],
 
 # build base executables
 docFiles = "README.txt"
-scripts = ["cxfreeze", "cxfreeze-quickstart"]
 options = dict(install=dict(optimize=1))
 depends = ["source/bases/Common.c"]
 console = Extension("cx_Freeze.bases.Console", ["source/bases/Console.c"],
         depends = depends, libraries = libraries)
 extensions = [utilModule, console]
 if sys.platform == "win32":
-    scripts.append("cxfreeze-postinstall")
     gui = Extension("cx_Freeze.bases.Win32GUI", ["source/bases/Win32GUI.c"],
             depends = depends, libraries = libraries + ["user32"])
     extensions.append(gui)
@@ -154,6 +155,8 @@ classifiers = [
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.5",
         "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3 :: Only",
         "Topic :: Software Development :: Build Tools",
         "Topic :: Software Development :: Libraries :: Python Modules",
@@ -161,10 +164,16 @@ classifiers = [
         "Topic :: Utilities"
 ]
 
+with open("cx_Freeze/__init__.py") as fp:
+    for line in fp:
+        if line.startswith('__version__'):
+            version = line.replace('__version__ = "', '').replace('"\n', '')
+            break
+
 setup(name = "cx_Freeze",
         description = "create standalone executables from Python scripts",
         long_description = "create standalone executables from Python scripts",
-        version = "6.0",
+        version = version,
         cmdclass = commandClasses,
         options = options,
         ext_modules = extensions,
@@ -172,9 +181,15 @@ setup(name = "cx_Freeze",
         maintainer="Anthony Tuininga",
         maintainer_email="anthony.tuininga@gmail.com",
         url = "https://anthony-tuininga.github.io/cx_Freeze",
-        scripts = scripts,
         classifiers = classifiers,
         keywords = "freeze",
         license = "Python Software Foundation License",
-        package_data = {"cx_Freeze" : packageData })
-
+        package_data = {"cx_Freeze" : packageData },
+        entry_points = {
+                'console_scripts': [
+                        'cxfreeze = cx_Freeze.main:main',
+                        'cxfreeze-quickstart = cx_Freeze.setupwriter:main',
+                ],
+        },
+        zip_safe=False,
+)

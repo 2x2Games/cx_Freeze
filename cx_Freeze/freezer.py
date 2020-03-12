@@ -21,22 +21,6 @@ import cx_Freeze
 
 __all__ = [ "ConfigError", "ConstantsModule", "Executable", "Freezer" ]
 
-MSVCR_MANIFEST_TEMPLATE = """
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-<noInheritable/>
-<assemblyIdentity
-    type="win32"
-    name="Microsoft.VC90.CRT"
-    version="9.0.21022.8"
-    processorArchitecture="{PROC_ARCH}"
-    publicKeyToken="1fc8b3b9a1e18e3b"/>
-<file name="MSVCR90.DLL"/>
-<file name="MSVCM90.DLL"/>
-<file name="MSVCP90.DLL"/>
-</assembly>
-"""
-
 def process_path_specs(specs):
     """Prepare paths specified as config.
 
@@ -86,7 +70,7 @@ def get_resource_file_path(dirName, name, ext):
 
 class Freezer(object):
 
-    def __init__(self, executables, constantsModules = [], includes = [],
+    def __init__(self, executables, constantsModule = None, includes = [],
             excludes = [], packages = [], replacePaths = [], compress = True,
             optimizeFlag = 0, path = None, targetDir = None, binIncludes = [],
             binExcludes = [], binPathIncludes = [], binPathExcludes = [],
@@ -94,7 +78,9 @@ class Freezer(object):
             namespacePackages = [], metadata = None, includeMSVCR = False,
             zipIncludePackages = [], zipExcludePackages = ["*"]):
         self.executables = list(executables)
-        self.constantsModules = list(constantsModules)
+        if constantsModule is None:
+            constantsModule = ConstantsModule()
+        self.constantsModule = constantsModule
         self.includes = list(includes)
         self.excludes = list(excludes)
         self.packages = list(packages)
@@ -143,7 +129,7 @@ class Freezer(object):
         stamp(fileName, versionInfo)
 
     def _CopyFile(self, source, target, copyDependentFiles,
-            includeMode = False):
+            includeMode = False, relativeSource = False):
         normalizedSource = os.path.normcase(os.path.normpath(source))
         normalizedTarget = os.path.normcase(os.path.normpath(target))
         if normalizedTarget in self.filesCopied:
@@ -161,14 +147,21 @@ class Freezer(object):
             shutil.copymode(source, target)
         self.filesCopied[normalizedTarget] = None
         if copyDependentFiles \
-                and source not in self.finder.excludeDependentFiles:
+                and source not in self.finder.exclude_dependent_files:
             # Always copy dependent files on root directory
             # to allow to set relative reference
             if sys.platform == 'darwin':
                 targetDir = self.targetDir
+            sourceDir = os.path.dirname(source)
             for source in self._GetDependentFiles(source):
-                target = os.path.join(targetDir, os.path.basename(source))
-                self._CopyFile(source, target, copyDependentFiles)
+                if relativeSource and os.path.isabs(source) and \
+                        os.path.commonpath((source, sourceDir)) == sourceDir:
+                    relative = os.path.relpath(source, sourceDir)
+                    target = os.path.join(targetDir, relative)
+                else:
+                    target = os.path.join(targetDir, os.path.basename(source))
+                self._CopyFile(source, target, copyDependentFiles,
+                               relativeSource=relativeSource)
 
     def _CreateDirectory(self, path):
         if not os.path.isdir(path):
@@ -184,8 +177,20 @@ class Freezer(object):
                 ".py")
         finder.IncludeFile(startupModule)
 
-        self._CopyFile(exe.base, exe.targetName, copyDependentFiles = True,
-                includeMode = True)
+        # Always copy the python dynamic libraries into lib folder
+        if sys.platform == "linux":
+            self._CopyFile(exe.base, exe.targetName,
+                           copyDependentFiles=False, includeMode=True)
+            targetDir = os.path.join(os.path.dirname(exe.targetName), 'lib')
+            dependentFiles = self._GetDependentFiles(exe.base) or \
+                             self._GetDependentFiles(sys.executable)
+            for source in dependentFiles:
+                target = os.path.join(targetDir, os.path.basename(source))
+                self._CopyFile(source, target,
+                               copyDependentFiles=True, includeMode=True)
+        else:
+            self._CopyFile(exe.base, exe.targetName,
+                           copyDependentFiles=True, includeMode=True)
         if not os.access(exe.targetName, os.W_OK):
             mode = os.stat(exe.targetName).st_mode
             os.chmod(exe.targetName, mode | stat.S_IWUSR)
@@ -200,9 +205,9 @@ class Freezer(object):
                 cx_Freeze.util.AddIcon(exe.targetName, exe.icon)
             else:
                 targetName = os.path.join(os.path.dirname(exe.targetName),
-                        os.path.basename(exe.icon))
+                                          os.path.basename(exe.icon))
                 self._CopyFile(exe.icon, targetName,
-                        copyDependentFiles = False)
+                               copyDependentFiles=False)
 
         if self.metadata is not None and sys.platform == "win32":
             self._AddVersionResource(exe)
@@ -215,15 +220,16 @@ class Freezer(object):
         if sys.platform == "win32":
             return ["comctl32.dll", "oci.dll", "cx_Logging.pyd"]
         else:
-            return ["libclntsh.so", "libwtc9.so"]
+            return ["libclntsh.so", "libwtc9.so", "ldd"]
 
     def _GetDefaultBinIncludes(self):
         """Return the file names of libraries which must be included for the
            frozen executable to work."""
         if sys.platform == "win32":
-            pythonDll = "python%s%s.dll" % sys.version_info[:2]
-            return [pythonDll, "gdiplus.dll", "mfc71.dll", "msvcp71.dll",
-                    "msvcr71.dll"]
+            pythonDlls = ["python%s.dll" % sys.version_info[0],
+                          "python%s%s.dll" % sys.version_info[:2],
+                          "vcruntime140.dll"]
+            return pythonDlls
         else:
             soName = distutils.sysconfig.get_config_var("INSTSONAME")
             if soName is None:
@@ -250,11 +256,12 @@ class Freezer(object):
         """Return the file's dependencies using platform-specific tools (the
            imagehlp library on Windows, otool on Mac OS X and ldd on Linux);
            limit this list by the exclusion lists as needed"""
+        path = os.path.normcase(path)
         dirname = os.path.dirname(path)
         dependentFiles = self.dependentFiles.get(path)
         if dependentFiles is None:
             if sys.platform == "win32":
-                if path.endswith(('.exe', '.dll')):
+                if path.endswith(('.exe', '.dll', '.pyd')):
                     origPath = os.environ["PATH"]
                     os.environ["PATH"] = origPath + os.pathsep + \
                             os.pathsep.join(sys.path)
@@ -312,9 +319,13 @@ class Freezer(object):
                                       for p in dependentFiles]
                     dependentFiles = [p.replace('@rpath', sys.prefix + '/lib')
                                       for p in dependentFiles]
-            dependentFiles = self.dependentFiles[path] = \
-                    [self._CheckDependentFile(f, dirname) \
-                            for f in dependentFiles if self._ShouldCopyFile(f)]
+            if sys.platform == "darwin":
+                dependentFiles = [self._CheckDependentFile(f, dirname)
+                    for f in dependentFiles if self._ShouldCopyFile(f)]
+            else:
+                dependentFiles = [f
+                    for f in dependentFiles if self._ShouldCopyFile(f)]
+            self.dependentFiles[path] = dependentFiles
         return dependentFiles
 
     def _CheckDependentFile(self, dependentFile, dirname):
@@ -335,7 +346,9 @@ class Freezer(object):
         if argsSource is None:
             argsSource = self
         finder = cx_Freeze.ModuleFinder(self.includeFiles, self.excludes,
-                self.path, self.replacePaths)
+                self.path, self.replacePaths, self.zipIncludeAllPackages,
+                self.zipExcludePackages, self.zipIncludePackages,
+                self.constantsModule, self.zipIncludes)
         for name in self.namespacePackages:
             package = finder.IncludeModule(name, namespace = True)
             package.ExtendPath()
@@ -346,12 +359,10 @@ class Freezer(object):
         return finder
 
     def _IncludeMSVCR(self, exe):
-        msvcRuntimeDll = None
         targetDir = os.path.dirname(exe.targetName)
         for fullName in self.filesCopied:
             path, name = os.path.split(os.path.normcase(fullName))
             if name.startswith("msvcr") and name.endswith(".dll"):
-                msvcRuntimeDll = name
                 for otherName in [name.replace("r", c) for c in "mp"]:
                     sourceName = os.path.join(self.msvcRuntimeDir, otherName)
                     if not os.path.exists(sourceName):
@@ -360,17 +371,6 @@ class Freezer(object):
                     self._CopyFile(sourceName, targetName,
                             copyDependentFiles = False)
                 break
-
-        if msvcRuntimeDll is not None and msvcRuntimeDll == "msvcr90.dll":
-            if struct.calcsize("P") == 4:
-                arch = "x86"
-            else:
-                arch = "amd64"
-            manifest = MSVCR_MANIFEST_TEMPLATE.strip().replace("{PROC_ARCH}",
-                    arch)
-            fileName = os.path.join(targetDir, "Microsoft.VC90.CRT.manifest")
-            sys.stdout.write("creating %s\n" % fileName)
-            open(fileName, "w").write(manifest)
 
     def _PrintReport(self, fileName, modules):
         sys.stdout.write("writing zip file %s\n\n" % fileName)
@@ -447,17 +447,6 @@ class Freezer(object):
 
         return True
 
-    def _ShouldIncludeInFileSystem(self, module):
-        if module.parent is not None:
-            return self._ShouldIncludeInFileSystem(module.parent)
-        if module.path is None or module.file is None:
-            return False
-        if self.zipIncludeAllPackages \
-                and module.name not in self.zipExcludePackages \
-                or module.name in self.zipIncludePackages:
-            return False
-        return True
-
     def _VerifyConfiguration(self):
         if self.compress is None:
             self.compress = True
@@ -488,8 +477,7 @@ class Freezer(object):
             executable._VerifyConfiguration(self)
 
     def _WriteModules(self, fileName, finder):
-        for module in self.constantsModules:
-            module.Create(finder)
+        self.constantsModule.Create(finder)
         modules = [m for m in finder.modules \
                 if m.name not in self.excludeModules]
         modules.sort(key = lambda m: m.name)
@@ -514,7 +502,7 @@ class Freezer(object):
             # require will be found in a location relative to where
             # they are located on disk; these packages will fail with strange
             # errors when they are written to a zip file instead
-            includeInFileSystem = self._ShouldIncludeInFileSystem(module)
+            includeInFileSystem = module.WillBeStoredInFileSystem()
 
             # if the module refers to a package, check to see if this package
             # should be included in the zip file or should be written to the
@@ -586,8 +574,16 @@ class Freezer(object):
                 outFile.writestr(zinfo, data)
 
         # write any files to the zip file that were requested specially
-        for sourceFileName, targetFileName in self.zipIncludes:
-            outFile.write(sourceFileName, targetFileName)
+        for sourceFileName, targetFileName in finder.zip_includes:
+            if os.path.isdir(sourceFileName):
+                for dirPath, _, fileNames in os.walk(sourceFileName):
+                    basePath = dirPath[len(sourceFileName):]
+                    targetPath = targetFileName + basePath.replace("\\", "/")
+                    for name in fileNames:
+                        outFile.write(os.path.join(dirPath, name),
+                                targetPath + "/" + name)
+            else:
+                outFile.write(sourceFileName, targetFileName)
 
         outFile.close()
 
@@ -598,7 +594,8 @@ class Freezer(object):
                 if module.parent is not None:
                     path = os.pathsep.join([origPath] + module.parent.path)
                     os.environ["PATH"] = path
-                self._CopyFile(module.file, target, copyDependentFiles = True)
+                self._CopyFile(module.file, target, copyDependentFiles=True,
+                               relativeSource=(sys.platform == "linux"))
             finally:
                 os.environ["PATH"] = origPath
 
@@ -621,7 +618,7 @@ class Freezer(object):
         self._RemoveFile(fileName)
         self._WriteModules(fileName, self.finder)
 
-        for sourceFileName, targetFileName in self.includeFiles:
+        for sourceFileName, targetFileName in self.finder.include_files:
             if os.path.isdir(sourceFileName):
                 # Copy directories by recursing into them.
                 # Can't use shutil.copytree because we may need dependencies
@@ -704,12 +701,22 @@ class Executable(object):
 class ConstantsModule(object):
 
     def __init__(self, releaseString = None, copyright = None,
-            moduleName = "BUILD_CONSTANTS", timeFormat = "%B %d, %Y %H:%M:%S"):
+            moduleName="BUILD_CONSTANTS", timeFormat="%B %d, %Y %H:%M:%S",
+            constants=[]):
         self.moduleName = moduleName
         self.timeFormat = timeFormat
         self.values = {}
         self.values["BUILD_RELEASE_STRING"] = releaseString
         self.values["BUILD_COPYRIGHT"] = copyright
+        for constant in constants:
+            parts = constant.split("=")
+            if len(parts) == 1:
+                name = constant
+                value = None
+            else:
+                name, stringValue = parts
+                value = eval(stringValue)
+            self.values[name] = value
 
     def Create(self, finder):
         """Create the module which consists of declaration statements for each
@@ -719,7 +726,7 @@ class ConstantsModule(object):
         for module in finder.modules:
             if module.file is None:
                 continue
-            if module.inZipFile:
+            if module.source_is_zip_file:
                 continue
             if not os.path.exists(module.file):
                 raise ConfigError("no file named %s (for module %s)",
